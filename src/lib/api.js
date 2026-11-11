@@ -2,118 +2,161 @@ import { SAMPLE_VIDEOS, extractVideoId } from './utils'
 
 /**
  * BACKEND CONFIGURATION
- * Simply paste your Hugging Face Space URL below when ready (or define VITE_API_URL in .env).
- * Example: 'https://username-sentimentlens.hf.space'
+ * Connected directly to your Hugging Face Space:
+ * https://huggingface.co/spaces/Avinash159-159/yt-comment-sentiment-demo
  */
-export const HUGGINGFACE_BACKEND_URL = import.meta.env.VITE_API_URL || ''
+export const HUGGINGFACE_BACKEND_URL =
+  import.meta.env.VITE_API_URL ||
+  'https://avinash159-159-yt-comment-sentiment-demo.hf.space'
 
-// Main Analyze Function
-export async function analyzeYouTube({ url, maxComments = 500, sort = 'top', onProgress }) {
-  const backendUrl = HUGGINGFACE_BACKEND_URL.trim().replace(/\/+$/, '')
+/**
+ * Main Analyze Function
+ * Queries the live DistilRoBERTa model on Hugging Face Spaces.
+ */
+export async function analyzeYouTube({ url, maxComments = 200, sort = 'top', onProgress }) {
+  // Check if user clicked one of the instant pre-cached sample chips
+  const matchedSample = SAMPLE_VIDEOS.find(s => s.url === url.trim())
+  if (matchedSample) {
+    return simulateMockAnalysis({ url, maxComments, onProgress, sampleData: matchedSample.data })
+  }
 
-  // 1. If backend URL is defined in the project, route to Hugging Face backend
-  if (backendUrl) {
-    try {
-      if (onProgress) onProgress(0) // Fetching comments
-      
-      const response = await fetch(`${backendUrl}/analyze`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({
-          url,
-          max_comments: Number(maxComments),
-          sort: sort
-        })
-      })
+  // Call the live Hugging Face Gradio Space
+  try {
+    return await callHuggingFaceBackend(url, maxComments, onProgress)
+  } catch (err) {
+    console.error('Hugging Face backend request failed:', err)
+    throw new Error(err.message || 'Unable to connect to Hugging Face backend.')
+  }
+}
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}))
-        throw new Error(errorData.detail || errorData.message || `Backend error: ${response.status}`)
+/**
+ * Call the live Hugging Face Gradio backend
+ */
+async function callHuggingFaceBackend(url, maxComments = 200, onProgress) {
+  // Gradio slider accepts between 10 and 500 comments
+  const safeCount = Math.min(500, Math.max(10, Math.round(Number(maxComments) || 200)))
+  const videoId = extractVideoId(url)
+
+  if (onProgress) onProgress(0) // Step 0: Fetching comments from YouTube API
+
+  const baseUrl = HUGGINGFACE_BACKEND_URL.trim().replace(/\/+$/, '')
+  const callUrl = `${baseUrl}/gradio_api/call/analyze_video`
+
+  // 1. Initiate job on Gradio endpoint
+  const postRes = await fetch(callUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: JSON.stringify({
+      data: [url.trim(), safeCount]
+    })
+  })
+
+  if (!postRes.ok) {
+    const errorText = await postRes.text().catch(() => '')
+    throw new Error(`Failed to initiate backend job (${postRes.status}): ${errorText || 'Server error'}`)
+  }
+
+  const { event_id } = await postRes.json()
+  if (!event_id) {
+    throw new Error('Backend did not return an event ID.')
+  }
+
+  // Smooth UI progress stepper while the transformer processes
+  if (onProgress) {
+    setTimeout(() => onProgress(1), 700)  // Step 1: Cleaning text
+    setTimeout(() => onProgress(2), 1800) // Step 2: Running DistilRoBERTa model
+  }
+
+  // 2. Fetch results from Gradio SSE stream
+  const sseUrl = `${baseUrl}/gradio_api/call/analyze_video/${event_id}`
+  const getRes = await fetch(sseUrl)
+
+  if (!getRes.ok) {
+    throw new Error(`Failed to fetch backend stream (${getRes.status})`)
+  }
+
+  const streamText = await getRes.text()
+
+  let completeData = null
+  let errorMessage = null
+
+  const lines = streamText.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim()
+    if (line.startsWith('event: error')) {
+      const nextDataLine = lines.slice(i).find(l => l.startsWith('data:'))
+      if (nextDataLine) {
+        try {
+          const errObj = JSON.parse(nextDataLine.replace(/^data:\s*/, ''))
+          errorMessage = errObj.error || errObj.message || JSON.stringify(errObj)
+        } catch (_) {
+          errorMessage = nextDataLine.replace(/^data:\s*/, '')
+        }
       }
+      break
+    }
 
-      const result = await response.json()
-      return normalizeBackendResponse(result, maxComments)
-    } catch (err) {
-      console.warn('Backend request failed, checking demo fallback:', err)
-      const isSample = SAMPLE_VIDEOS.some(s => s.url === url)
-      if (!isSample) {
-        throw new Error(`Failed to connect to backend (${backendUrl}): ${err.message}`)
-      }
+    if (line.startsWith('data:')) {
+      try {
+        const parsed = JSON.parse(line.replace(/^data:\s*/, ''))
+        if (Array.isArray(parsed) && parsed.length >= 3) {
+          completeData = parsed
+        }
+      } catch (_) {}
     }
   }
 
-  // 2. Demo Engine (active by default until HF URL is configured, or when clicking sample chips)
-  return simulateMockAnalysis({ url, maxComments, sort, onProgress })
-}
-
-// Simulate realistic 4-step loading with sample data
-async function simulateMockAnalysis({ url, maxComments, sort, onProgress }) {
-  // Step 0: Fetching comments
-  if (onProgress) onProgress(0)
-  await new Promise(r => setTimeout(r, 600))
-
-  // Step 1: Cleaning text
-  if (onProgress) onProgress(1)
-  await new Promise(r => setTimeout(r, 500))
-
-  // Step 2: Running model (DistilRoBERTa)
-  if (onProgress) onProgress(2)
-  await new Promise(r => setTimeout(r, 700))
-
-  // Step 3: Building charts
-  if (onProgress) onProgress(3)
-  await new Promise(r => setTimeout(r, 400))
-
-  // Check if matches known samples
-  const matchedSample = SAMPLE_VIDEOS.find(s => s.url === url)
-  if (matchedSample) {
-    return JSON.parse(JSON.stringify(matchedSample.data))
+  if (errorMessage) {
+    throw new Error(errorMessage)
   }
 
-  // Dynamic simulation for any YouTube URL
-  const videoId = extractVideoId(url) || 'dQw4w9WgXcQ'
-  const total = Number(maxComments) || 500
-
-  // Realistic sentiment distribution
-  const posCount = Math.round(total * 0.52)
-  const neuCount = Math.round(total * 0.28)
-  const negCount = total - posCount - neuCount
-
-  const baseComments = [
-    { text: "This is easily the cleanest explanation I've seen on the topic. Invaluable resource!", label: 2, confidence: 0.97, likes: 412 },
-    { text: "Outstanding breakdown of the transformer fine-tuning nuances. Saved me days of debugging.", label: 2, confidence: 0.95, likes: 289 },
-    { text: "The audio quality around 4:20 was slightly muffled, but the content itself was top tier.", label: 1, confidence: 0.72, likes: 45 },
-    { text: "Could you share the notebook and weights used for the Stage C benchmark?", label: 1, confidence: 0.68, likes: 88 },
-    { text: "Still not convinced that an MLP head outperforms a simple linear probe in low-data regimes.", label: 1, confidence: 0.76, likes: 34 },
-    { text: "Why is everyone using DistilRoBERTa when modern smaller quantized LLMs exist?", label: 0, confidence: 0.84, likes: 67 },
-    { text: "Completely skipped over the data preprocessing pipeline. Disappointing lack of depth there.", label: 0, confidence: 0.92, likes: 145 },
-    { text: "The visualization of the confusion matrix and middle-class leakage is brilliant.", label: 2, confidence: 0.96, likes: 198 },
-    { text: "What learning rate did you use for the Adam optimizer on the encoder layers?", label: 1, confidence: 0.64, likes: 18 },
-    { text: "Terrible presentation pace, skipped through half of it.", label: 0, confidence: 0.95, likes: 82 },
-    { text: "Super crisp delivery and great visual slides. Subscribed!", label: 2, confidence: 0.98, likes: 310 },
-    { text: "Interesting that test accuracy reached 77.57% on a 3-class balanced dataset.", label: 2, confidence: 0.91, likes: 73 }
-  ]
-
-  // Expand comments list
-  const comments = []
-  for (let i = 0; i < Math.min(total, 60); i++) {
-    const template = baseComments[i % baseComments.length]
-    comments.push({
-      ...template,
-      likes: Math.max(0, Math.floor(template.likes * (1 - (i * 0.015)))),
-      confidence: Number((Math.min(0.99, template.confidence + (Math.random() * 0.04 - 0.02))).toFixed(2))
-    })
+  if (!completeData) {
+    throw new Error('Backend completed without returning results. The video may have comments disabled or restricted.')
   }
+
+  if (onProgress) onProgress(3) // Step 3: Building charts
+
+  const [summary, share, df] = completeData
+
+  // Normalize dataframe comments: [comment, prediction, confidence, p_Negative, p_Neutral, p_Positive, likes]
+  const rawRows = df?.data || []
+  const comments = rawRows.map(row => {
+    const text = String(row[0] || '')
+    const pred = String(row[1] || '').toLowerCase()
+    let label = 1 // neutral default
+    if (pred === 'positive') label = 2
+    else if (pred === 'negative') label = 0
+
+    const confidence = typeof row[2] === 'number' ? Number(row[2].toFixed(3)) : 0.85
+    const likes = typeof row[6] === 'number' ? row[6] : 0
+
+    return {
+      text,
+      label,
+      confidence,
+      likes
+    }
+  })
+
+  const negCount = summary.distribution?.Negative?.count ?? 0
+  const neuCount = summary.distribution?.Neutral?.count ?? 0
+  const posCount = summary.distribution?.Positive?.count ?? 0
+  const totalAnalyzed = summary.comments_analyzed || comments.length || safeCount
+
+  // Live YouTube thumbnail
+  const thumbnail = videoId
+    ? `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`
+    : 'https://images.unsplash.com/photo-1611162617474-5b21e879e113?auto=format&fit=crop&w=600&q=80'
 
   return {
     video: {
-      title: `Analysis of YouTube Video (${videoId})`,
-      channel: 'Creator Channel',
-      thumbnail: `https://images.unsplash.com/photo-1611162617474-5b21e879e113?auto=format&fit=crop&w=600&q=80`,
-      total
+      title: summary.video_title || 'YouTube Video',
+      channel: 'YouTube Video Analysis',
+      thumbnail,
+      total: totalAnalyzed
     },
     counts: {
       negative: negCount,
@@ -121,40 +164,26 @@ async function simulateMockAnalysis({ url, maxComments, sort, onProgress }) {
       positive: posCount
     },
     avg_confidence: {
-      negative: 0.82,
-      neutral: 0.68,
-      positive: 0.87
+      negative: summary.distribution?.Negative?.avg_confidence ?? 0.81,
+      neutral: summary.distribution?.Neutral?.avg_confidence ?? 0.72,
+      positive: summary.distribution?.Positive?.avg_confidence ?? 0.85
     },
     comments
   }
 }
 
-// Normalize incoming backend payload
-function normalizeBackendResponse(res, requestedTotal) {
-  if (!res) throw new Error('Empty response from backend')
+/**
+ * Fast simulated mock analysis for instant sample preview chips
+ */
+async function simulateMockAnalysis({ url, maxComments, onProgress, sampleData }) {
+  if (onProgress) onProgress(0)
+  await new Promise(r => setTimeout(r, 400))
+  if (onProgress) onProgress(1)
+  await new Promise(r => setTimeout(r, 400))
+  if (onProgress) onProgress(2)
+  await new Promise(r => setTimeout(r, 500))
+  if (onProgress) onProgress(3)
+  await new Promise(r => setTimeout(r, 300))
 
-  return {
-    video: {
-      title: res.video?.title || 'YouTube Video',
-      channel: res.video?.channel || 'YouTube Channel',
-      thumbnail: res.video?.thumbnail || 'https://images.unsplash.com/photo-1611162617474-5b21e879e113?auto=format&fit=crop&w=600&q=80',
-      total: res.video?.total || res.comments?.length || requestedTotal || 0
-    },
-    counts: {
-      negative: res.counts?.negative ?? 0,
-      neutral: res.counts?.neutral ?? 0,
-      positive: res.counts?.positive ?? 0
-    },
-    avg_confidence: {
-      negative: res.avg_confidence?.negative ?? 0.8,
-      neutral: res.avg_confidence?.neutral ?? 0.7,
-      positive: res.avg_confidence?.positive ?? 0.85
-    },
-    comments: (res.comments || []).map(c => ({
-      text: c.text || '',
-      label: typeof c.label === 'number' ? c.label : (c.label === 'positive' ? 2 : c.label === 'neutral' ? 1 : 0),
-      confidence: typeof c.confidence === 'number' ? c.confidence : 0.85,
-      likes: c.likes ?? 0
-    }))
-  }
+  return JSON.parse(JSON.stringify(sampleData))
 }
